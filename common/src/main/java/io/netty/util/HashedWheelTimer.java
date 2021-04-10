@@ -84,33 +84,55 @@ public class HashedWheelTimer implements Timer {
 
     private static final AtomicInteger INSTANCE_COUNTER = new AtomicInteger();
     private static final AtomicBoolean WARNED_TOO_MANY_INSTANCES = new AtomicBoolean();
+    // 在服务过程中，时间轮实例个数不能超过64个
     private static final int INSTANCE_COUNT_LIMIT = 64;
+    // 刻度持续时长最小值，不能小于这个最小值
     private static final long MILLISECOND_NANOS = TimeUnit.MILLISECONDS.toNanos(1);
+    // 内存泄漏检测
     private static final ResourceLeakDetector<HashedWheelTimer> leakDetector = ResourceLeakDetectorFactory.instance()
             .newResourceLeakDetector(HashedWheelTimer.class, 1);
 
+    // 原子性更新时间轮工作状态，防止多线程重复操作
     private static final AtomicIntegerFieldUpdater<HashedWheelTimer> WORKER_STATE_UPDATER =
             AtomicIntegerFieldUpdater.newUpdater(HashedWheelTimer.class, "workerState");
 
+    // 内存泄漏检测虚引用
     private final ResourceLeakTracker<HashedWheelTimer> leak;
+    // 用于构建时间轮工作线程的Runnable掌控指针的跳动
     private final Worker worker = new Worker();
+    // 时间轮工作线程
     private final Thread workerThread;
 
+    // 时间轮的3种工作状态分别为初始化、已经启动正在运行、停止
     public static final int WORKER_STATE_INIT = 0;
     public static final int WORKER_STATE_STARTED = 1;
     public static final int WORKER_STATE_SHUTDOWN = 2;
     @SuppressWarnings({ "unused", "FieldMayBeFinal" })
     private volatile int workerState; // 0 - init, 1 - started, 2 - shut down
 
+    // 每刻度的持续时间
     private final long tickDuration;
+    // 此数组用于存储映射在时间轮刻度上的任务
     private final HashedWheelBucket[] wheel;
+    // 时间轮总格子数-1
     private final int mask;
+    // 同步计数器，时间轮Worker线程启动后，将同步调用给时间轮的线程
     private final CountDownLatch startTimeInitialized = new CountDownLatch(1);
+    // 超时task任务队列，先将任务放入这个队列中
+    // 再在worker线程中从队列中取出并放入wheel[] 的链表中
     private final Queue<HashedWheelTimeout> timeouts = PlatformDependent.newMpscQueue();
+    /**
+     * 取消task任务存放队列
+     * 在Worker线程中会检测是否有任务需要取消
+     * 若有，则找到对应的链表
+     * 并修改这些取消任务的前后任务的指针
+     */
     private final Queue<HashedWheelTimeout> cancelledTimeouts = PlatformDependent.newMpscQueue();
+    // 目前需要等待执行的任务数
     private final AtomicLong pendingTimeouts = new AtomicLong(0);
+    // 时间轮做多容纳多少定时检测任务，默认为-1，无限制
     private final long maxPendingTimeouts;
-
+    // 时间轮启动时间
     private volatile long startTime;
 
     /**
@@ -221,16 +243,17 @@ public class HashedWheelTimer implements Timer {
     /**
      * Creates a new timer.
      *
-     * @param threadFactory        a {@link ThreadFactory} that creates a
-     *                             background {@link Thread} which is dedicated to
-     *                             {@link TimerTask} execution.
-     * @param tickDuration         the duration between tick
-     * @param unit                 the time unit of the {@code tickDuration}
-     * @param ticksPerWheel        the size of the wheel
-     * @param leakDetection        {@code true} if leak detection should be enabled always,
+ * @param threadFactory 线程工厂              a {@link ThreadFactory} that creates a
+     *                                      background {@link Thread} which is dedicated to
+     *                                      {@link TimerTask} execution.
+     * @param tickDuration  刻度持续时间       the duration between tick
+     * @param unit          刻度持续时长单位       the time unit of the {@code tickDuration}
+     * @param ticksPerWheel 时间轮总刻度数         the size of the wheel
+     * @param leakDetection  是否开启内存泄漏检测      {@code true} if leak detection should be enabled always,
      *                             if false it will only be enabled if the worker thread is not
      *                             a daemon thread.
-     * @param  maxPendingTimeouts  The maximum number of pending timeouts after which call to
+     * @param  maxPendingTimeouts 时间轮可接受最大定时任务检测任务数
+     *                           The maximum number of pending timeouts after which call to
      *                             {@code newTimeout} will result in
      *                             {@link java.util.concurrent.RejectedExecutionException}
      *                             being thrown. No maximum pending timeouts limit is assumed if
@@ -249,12 +272,16 @@ public class HashedWheelTimer implements Timer {
         ObjectUtil.checkPositive(ticksPerWheel, "ticksPerWheel");
 
         // Normalize ticksPerWheel to power of two and initialize the wheel.
+        // 对时间轮刻度数进行格式化，转换成离ticksPerWheel最近的2的整数次幂，并初始化wheel数组
         wheel = createWheel(ticksPerWheel);
         mask = wheel.length - 1;
 
         // Convert tickDuration to nanos.
+        // 把刻度持续时长转换成纳秒，这样更加精确
         long duration = unit.toNanos(tickDuration);
-
+        /**
+         * 检测持续时长不能太长，也不能太短
+         */
         // Prevent overflow.
         if (duration >= Long.MAX_VALUE / wheel.length) {
             throw new IllegalArgumentException(String.format(
@@ -269,13 +296,13 @@ public class HashedWheelTimer implements Timer {
         } else {
             this.tickDuration = duration;
         }
-
+        // 构建时间轮的work线程
         workerThread = threadFactory.newThread(worker);
-
+        // 是否需要内存泄漏检测
         leak = leakDetection || !workerThread.isDaemon() ? leakDetector.track(this) : null;
-
+        // 最大定时检测任务个数
         this.maxPendingTimeouts = maxPendingTimeouts;
-
+        // 时间轮实例个数检测，超过64个会警告
         if (INSTANCE_COUNTER.incrementAndGet() > INSTANCE_COUNT_LIMIT &&
             WARNED_TOO_MANY_INSTANCES.compareAndSet(false, true)) {
             reportTooManyInstances();
@@ -326,11 +353,14 @@ public class HashedWheelTimer implements Timer {
      * start automatically on demand even if you did not call this method.
      *
      * @throws IllegalStateException if this timer has been
-     *                               {@linkplain #stop() stopped} already
+     * 时间轮启动                              {@linkplain #stop() stopped} already
      */
     public void start() {
+        // 根据时间轮状态进行对应的处理
         switch (WORKER_STATE_UPDATER.get(this)) {
+            // 当时间轮处于初始化状态时，需要启动它
             case WORKER_STATE_INIT:
+                // 原子性启动
                 if (WORKER_STATE_UPDATER.compareAndSet(this, WORKER_STATE_INIT, WORKER_STATE_STARTED)) {
                     workerThread.start();
                 }
@@ -344,6 +374,7 @@ public class HashedWheelTimer implements Timer {
         }
 
         // Wait until the startTime is initialized by the worker.
+        // 等待work线程初始化成功
         while (startTime == 0) {
             try {
                 startTimeInitialized.await();
@@ -399,11 +430,21 @@ public class HashedWheelTimer implements Timer {
         return worker.unprocessedTimeouts();
     }
 
+    /**
+     * 时间轮添加定时任务
+     * @param task
+     * @param delay
+     * @param unit
+     * @return
+     */
     @Override
     public Timeout newTimeout(TimerTask task, long delay, TimeUnit unit) {
         ObjectUtil.checkNotNull(task, "task");
         ObjectUtil.checkNotNull(unit, "unit");
-
+        /**
+         * 需等待执行的任务数+1
+         * 同时判断是否超过了最大限制
+         */
         long pendingTimeoutsCount = pendingTimeouts.incrementAndGet();
 
         if (maxPendingTimeouts > 0 && pendingTimeoutsCount > maxPendingTimeouts) {
@@ -412,9 +453,13 @@ public class HashedWheelTimer implements Timer {
                 + pendingTimeoutsCount + ") is greater than or equal to maximum allowed pending "
                 + "timeouts (" + maxPendingTimeouts + ")");
         }
-
+        // 若时间轮worker线程未启动，需启动
         start();
-
+        /**
+         * 根据定时任务延时执行时间与时间轮启动时间
+         * 获取相对时间轮开始后的任务执行延时时间
+         * 因为时间轮开始启动时间是不会改变的，所以通过这个时间可获取时钟需要跳动的刻度
+         */
         // Add the timeout to the timeout queue which will be processed on the next tick.
         // During processing all the queued HashedWheelTimeouts will be added to the correct HashedWheelBucket.
         long deadline = System.nanoTime() + unit.toNanos(delay) - startTime;
@@ -423,6 +468,10 @@ public class HashedWheelTimer implements Timer {
         if (delay > 0 && deadline < 0) {
             deadline = Long.MAX_VALUE;
         }
+        /**
+         * 构建定时检测恩物，将其添加到新增定时检测任务队列中
+         * 在worker线程中，会从队列中取出定时检测任务平放入缓存数组wheel中
+         */
         HashedWheelTimeout timeout = new HashedWheelTimeout(this, task, deadline);
         timeouts.add(timeout);
         return timeout;
@@ -444,14 +493,19 @@ public class HashedWheelTimer implements Timer {
         }
     }
 
+    /****
+     * 时间轮的核心
+     */
     private final class Worker implements Runnable {
+        // 当调用了时间轮的stop（）方法后，将获取其未执行完的任务
         private final Set<Timeout> unprocessedTimeouts = new HashSet<Timeout>();
-
+        // 时钟指针跳动次数
         private long tick;
 
         @Override
         public void run() {
             // Initialize the startTime.
+            // 时间轮启动时间
             startTime = System.nanoTime();
             if (startTime == 0) {
                 // We use 0 as an indicator for the uninitialized value here, so make sure it's not 0 when initialized.
@@ -459,26 +513,43 @@ public class HashedWheelTimer implements Timer {
             }
 
             // Notify the other threads waiting for the initialization at start().
+            // work线程初始化了，通知调用时间轮启动的线程
             startTimeInitialized.countDown();
 
             do {
+                /**
+                 * 获取下一刻度时间轮总体的执行时间
+                 * 当这个时间与时间轮启动时间的和大于当前时间时，线程就会睡眠到这个时间点
+                 */
                 final long deadline = waitForNextTick();
                 if (deadline > 0) {
+                    // 获取刻度编号，即wheel数组的下表
                     int idx = (int) (tick & mask);
+                    // 先处理需要取消的任务
                     processCancelledTasks();
+                    // 获取刻度所在的缓存链表
                     HashedWheelBucket bucket =
                             wheel[idx];
+                    // 把新增的定时检测任务加入wheel数组的缓存链表中
                     transferTimeoutsToBuckets();
+                    // 循环执行刻度所在的缓存链表
                     bucket.expireTimeouts(deadline);
+                    // 执行完后，指针才正式跳动
                     tick++;
                 }
+                // 时间轮状态需转换为已启动态
             } while (WORKER_STATE_UPDATER.get(HashedWheelTimer.this) == WORKER_STATE_STARTED);
 
             // Fill the unprocessedTimeouts so we can return them from stop() method.
+            // 运行到这里说明时间轮停止了，需要把未处理的任务返回
             for (HashedWheelBucket bucket: wheel) {
                 bucket.clearTimeouts(unprocessedTimeouts);
             }
             for (;;) {
+                /**
+                 * 刚刚加入还未来得及放入时间轮缓存中的超时任务
+                 * 也需要捞出并放入unprocessedTimeouts中一起返回
+                 */
                 HashedWheelTimeout timeout = timeouts.poll();
                 if (timeout == null) {
                     break;
@@ -487,6 +558,7 @@ public class HashedWheelTimer implements Timer {
                     unprocessedTimeouts.add(timeout);
                 }
             }
+            // 处理需要取消的任务
             processCancelledTasks();
         }
 
@@ -539,12 +611,24 @@ public class HashedWheelTimer implements Timer {
          * current time otherwise (with Long.MIN_VALUE changed by +1)
          */
         private long waitForNextTick() {
+            // 获取下一刻度时间轮总体执行时间
             long deadline = tickDuration * (tick + 1);
 
             for (;;) {
+                // 当前时间-启动时间
                 final long currentTime = System.nanoTime() - startTime;
+                /**
+                 * 计算需要睡眠的毫秒时间
+                 * 由于将纳秒转换为毫秒时需要初一1000 000
+                 * 因此需要加上999 999，以防止丢失位数，任务被提前执行
+                 */
                 long sleepTimeMs = (deadline - currentTime + 999999) / 1000000;
 
+                /**
+                 * 当睡眠时间小于0且
+                 * 等于Long。MIN_VALUE时，直接跳过此刻度
+                 * 否则不睡眠，直接执行任务
+                 */
                 if (sleepTimeMs <= 0) {
                     if (currentTime == Long.MIN_VALUE) {
                         return -Long.MAX_VALUE;
@@ -558,6 +642,13 @@ public class HashedWheelTimer implements Timer {
                 // the JVM if it runs on windows.
                 //
                 // See https://github.com/netty/netty/issues/356
+                /**
+                 * Windows 操作系统特殊处理
+                 * 其Sleep函数是以10ms为单位进行延时的
+                 * 也就是说，所有小于10且大于0的情况都是10ms
+                 * 所有大于10且小于20的情况都是20ms
+                 * 因此这里做了特殊处理，对于小于10ms的，直接不睡眠，对于大于10ms的，去掉尾数
+                 */
                 if (PlatformDependent.isWindows()) {
                     sleepTimeMs = sleepTimeMs / 10 * 10;
                     if (sleepTimeMs == 0) {
@@ -568,6 +659,7 @@ public class HashedWheelTimer implements Timer {
                 try {
                     Thread.sleep(sleepTimeMs);
                 } catch (InterruptedException ignored) {
+                    // 当发生异常，发现时间轮状态为WORKER_STATE_SHUTDOWN时，立刻返回
                     if (WORKER_STATE_UPDATER.get(HashedWheelTimer.this) == WORKER_STATE_SHUTDOWN) {
                         return Long.MIN_VALUE;
                     }
