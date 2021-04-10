@@ -43,6 +43,7 @@ import static io.netty.util.internal.ObjectUtil.checkPositiveOrZero;
 
 /**
  * A skeletal implementation of a buffer.
+ * Netty对Nio的ByteBuffer的封装
  */
 public abstract class AbstractByteBuf extends ByteBuf {
     private static final InternalLogger logger = InternalLoggerFactory.getInstance(AbstractByteBuf.class);
@@ -68,10 +69,20 @@ public abstract class AbstractByteBuf extends ByteBuf {
     static final ResourceLeakDetector<ByteBuf> leakDetector =
             ResourceLeakDetectorFactory.instance().newResourceLeakDetector(ByteBuf.class);
 
+    // 读索引
     int readerIndex;
+    // 写索引
     int writerIndex;
+    /**
+     * 标记读索引
+     * 在解码时，由于消息不完整，无法处理
+     * 需要将readerIndex复位
+     * 此时需要先为索引做个标记
+     */
     private int markedReaderIndex;
+    // 标记写索引
     private int markedWriterIndex;
+    // 最大容量
     private int maxCapacity;
 
     protected AbstractByteBuf(int maxCapacity) {
@@ -277,19 +288,30 @@ public abstract class AbstractByteBuf extends ByteBuf {
 
     @Override
     public ByteBuf ensureWritable(int minWritableBytes) {
+        // 若最小可写为0，则无需扩容
         ensureWritable0(checkPositiveOrZero(minWritableBytes, "minWritableBytes"));
         return this;
     }
 
     final void ensureWritable0(int minWritableBytes) {
+        // 获取写索引
         final int writerIndex = writerIndex();
+        // 写入后的目标容量
         final int targetCapacity = writerIndex + minWritableBytes;
         // using non-short-circuit & to reduce branching - this is a hot path and targetCapacity should rarely overflow
+        //
         if (targetCapacity >= 0 & targetCapacity <= capacity()) {
+            // 获取byteBuf的引用计数，
+            // 如果返回值为零，则说明该对象被销毁，会抛出异常
             ensureAccessible();
             return;
         }
+        /**
+         * 判断判断将要写入的字节数是否大于最大可写字节数（maxCapacity-writerIndex）
+         * 如果大于则直接抛异常，否则继续执行
+         */
         if (checkBounds && (targetCapacity < 0 || targetCapacity > maxCapacity)) {
+            // 这里又校验了一次，老版本并没有这个，个人猜测是防止并发操作引用计数异常
             ensureAccessible();
             throw new IndexOutOfBoundsException(String.format(
                     "writerIndex(%d) + minWritableBytes(%d) exceeds maxCapacity(%d): %s",
@@ -297,11 +319,16 @@ public abstract class AbstractByteBuf extends ByteBuf {
         }
 
         // Normalize the target capacity to the power of 2.
+        // 返回不用复制和重新分配内存的最快、最大可写字节数，为2的幂数
         final int fastWritable = maxFastWritableBytes();
+        // 计算自动扩容后的容量，
+        // 如果已分配容量 >= 要写入字节数，新的容量=写索引+已分配容量
+        // 否则，需满足最小容量，必须是2的幂数
         int newCapacity = fastWritable >= minWritableBytes ? writerIndex + fastWritable
                 : alloc().calculateNewCapacity(targetCapacity, maxCapacity);
 
         // Adjust to the new capacity.
+        // 由子类将容量调整到新的容量值
         capacity(newCapacity);
     }
 
@@ -892,8 +919,12 @@ public abstract class AbstractByteBuf extends ByteBuf {
 
     @Override
     public ByteBuf readBytes(byte[] dst, int dstIndex, int length) {
+        // 检测byteBuf是否可读
+        // 检测其刻度长度是否小于length
         checkReadableBytes(length);
+        // 数据的具体读取由子类实现
         getBytes(readerIndex, dst, dstIndex, length);
+        // 修改读索引
         readerIndex += length;
         return this;
     }
@@ -1098,10 +1129,21 @@ public abstract class AbstractByteBuf extends ByteBuf {
         return this;
     }
 
+    /**
+     * netty扩容后的大小必须是2的整数次幂
+     * @param src
+     * @param srcIndex the first index of the source
+     * @param length   the number of bytes to transfer
+     *
+     * @return
+     */
     @Override
     public ByteBuf writeBytes(ByteBuf src, int srcIndex, int length) {
+        // 确保可写，当容量不足时自动扩容
         ensureWritable(length);
+        // 缓冲区真正的写操作由子类实现
         setBytes(writerIndex, src, srcIndex, length);
+        // 调整写索引
         writerIndex += length;
         return this;
     }

@@ -39,6 +39,10 @@ import static io.netty.util.internal.StringUtil.EMPTY_STRING;
 import static io.netty.util.internal.StringUtil.NEWLINE;
 import static io.netty.util.internal.StringUtil.simpleClassName;
 
+/**
+ * Netty 内存泄漏器
+ * @param <T>
+ */
 public class ResourceLeakDetector<T> {
 
     private static final String PROP_LEVEL_OLD = "io.netty.leakDetectionLevel";
@@ -57,25 +61,30 @@ public class ResourceLeakDetector<T> {
 
     /**
      * Represents the level of resource leak detection.
+     * 内存泄漏检测机制的4种级别
      */
     public enum Level {
         /**
          * Disables resource leak detection.
+         * 表示禁用，不开启检测
          */
         DISABLED,
         /**
          * Enables simplistic sampling resource leak detection which reports there is a leak or not,
          * at the cost of small overhead (default).
+         * 默认设置，表示按一定比例采集，但不疏忽调用栈信息
          */
         SIMPLE,
         /**
          * Enables advanced sampling resource leak detection which reports where the leaked object was accessed
          * recently at the cost of high overhead.
+         * 与SIMPLE一样，但输出调用栈信息
          */
         ADVANCED,
         /**
          * Enables paranoid resource leak detection which reports where the leaked object was accessed recently,
          * at the cost of the highest possible overhead (for testing purposes only).
+         * 偏执级别，按100%比例采集
          */
         PARANOID;
 
@@ -239,6 +248,7 @@ public class ResourceLeakDetector<T> {
      * {@link ResourceLeakTracker#close(Object)} when the related resource is deallocated.
      *
      * @return the {@link ResourceLeakTracker} or {@code null}
+     * 内存泄漏检测机制的入口
      */
     @SuppressWarnings("unchecked")
     public final ResourceLeakTracker<T> track(T obj) {
@@ -247,11 +257,20 @@ public class ResourceLeakDetector<T> {
 
     @SuppressWarnings("unchecked")
     private DefaultResourceLeak track0(T obj) {
+        // 获取内存泄漏检测级别
         Level level = ResourceLeakDetector.level;
+        // 不检测，也不采集
         if (level == Level.DISABLED) {
             return null;
         }
 
+        /**
+         * 当级别比偏执级别低时
+         * 获取一个128内的随机数
+         * 若得到的数部位0，则不采集
+         * 若为0，则检测是否有泄漏，并输出泄漏日志
+         * 同时创建一个弱引用
+         */
         if (level.ordinal() < Level.PARANOID.ordinal()) {
             if ((PlatformDependent.threadLocalRandom().nextInt(samplingInterval)) == 0) {
                 reportLeak();
@@ -259,6 +278,7 @@ public class ResourceLeakDetector<T> {
             }
             return null;
         }
+        // 偏执级别都采集
         reportLeak();
         return new DefaultResourceLeak(obj, refQueue, allLeaks);
     }
@@ -290,21 +310,31 @@ public class ResourceLeakDetector<T> {
         }
 
         // Detect and report previous leaks.
+        /**
+         * 循环获取引用队列弱引用
+         */
         for (;;) {
             DefaultResourceLeak ref = (DefaultResourceLeak) refQueue.poll();
             if (ref == null) {
                 break;
             }
 
+            /**
+             * 检测是否泄漏
+             * 若未泄漏，则继续下一次循环
+             */
             if (!ref.dispose()) {
                 continue;
             }
 
+            // 获取buf的调用栈信息
             String records = ref.toString();
+            // 不在输出曾经输出过得泄漏记录
             if (reportedLeaks.add(records)) {
                 if (records.isEmpty()) {
                     reportUntracedLeak(resourceType);
                 } else {
+                    // 输出内存泄漏日志及其调用栈信息
                     reportTracedLeak(resourceType, records);
                 }
             }
@@ -342,6 +372,10 @@ public class ResourceLeakDetector<T> {
     protected void reportInstancesLeak(String resourceType) {
     }
 
+    /**
+     * 该类负责跟踪资源最近调用轨迹，同时继承WeakReference弱引用
+     * @param <T>
+     */
     @SuppressWarnings("deprecation")
     private static final class DefaultResourceLeak<T>
             extends WeakReference<Object> implements ResourceLeakTracker<T>, ResourceLeak {
@@ -420,35 +454,62 @@ public class ResourceLeakDetector<T> {
          */
         private void record0(Object hint) {
             // Check TARGET_RECORDS > 0 here to avoid similar check before remove from and add to lastRecords
+            // 如果TARGET_RECORDS>0，则记录
             if (TARGET_RECORDS > 0) {
                 TraceRecord oldHead;
                 TraceRecord prevHead;
                 TraceRecord newHead;
                 boolean dropped;
                 do {
+                    /**
+                     * 判断链头是否为空，为空表示已关闭
+                     * 把之前的链头作为第二个元素赋值给新链表
+                     */
                     if ((prevHead = oldHead = headUpdater.get(this)) == null) {
                         // already closed.
                         return;
                     }
+                    // 获取新链表的长度
                     final int numElements = oldHead.pos + 1;
+                    // 若链表长度>=TARGET_RECORDS
                     if (numElements >= TARGET_RECORDS) {
+                        /**
+                         * backOffFactor 用来计算是否替换的银子
+                         * 其最小值为numElements-TARGET_RECORDS
+                         * 元素越多，其值越大，最大值为30
+                         */
                         final int backOffFactor = Math.min(numElements - TARGET_RECORDS, 30);
+                        /**
+                         * 1/2^backOffFactor的概率不会执行此if代码块
+                         * 代码快：prevHead = oldHead.next;
+                         * 表示之前用链头元素作为新链表的第二个元素
+                         * 丢弃原来的链头
+                         * 同时设置dropped为false
+                         */
                         if (dropped = PlatformDependent.threadLocalRandom().nextInt(1 << backOffFactor) != 0) {
                             prevHead = oldHead.next;
                         }
                     } else {
                         dropped = false;
                     }
+                    // 创建一个新的Record，并肩齐添加到链表上，作为链表新的头部
                     newHead = hint != null ? new TraceRecord(prevHead, hint) : new TraceRecord(prevHead);
                 } while (!headUpdater.compareAndSet(this, oldHead, newHead));
+                // 若有丢弃，则更新记录丢弃的数
                 if (dropped) {
                     droppedRecordsUpdater.incrementAndGet(this);
                 }
             }
         }
 
+        /**
+         * 判断是否泄漏
+         * @return
+         */
         boolean dispose() {
+            // 清理对资源对象的引用
             clear();
+            // 若引用缓存中还存在此引用，则说明buf未释放，内存泄漏了
             return allLeaks.remove(this);
         }
 
@@ -506,37 +567,59 @@ public class ResourceLeakDetector<T> {
             }
         }
 
+        /**
+         * 弱引用重写了toString（）方法
+         * 需注意：若采用IDE工具debug调试代码
+         * 则在处理对象时，IDE会自动调用toString（）方法
+         * @return
+         */
         @Override
         public String toString() {
+            // 获取记录列表头部
             TraceRecord oldHead = headUpdater.getAndSet(this, null);
+            // 若无记录，则返回空字符串
             if (oldHead == null) {
                 // Already closed
                 return EMPTY_STRING;
             }
 
+            // 若记录太长，则会丢弃部分记录，获取丢弃了多少记录
             final int dropped = droppedRecordsUpdater.get(this);
             int duped = 0;
 
+            /**
+             * 由于每次在链表新增头部时，其pos=旧的pos+1
+             * 因此最新的链表头部的pos就是链表长度
+             */
             int present = oldHead.pos + 1;
             // Guess about 2 kilobytes per stack trace
+            // 设置buf的容量（大概为2KB栈信息 * 链表长度），并添加换行符
             StringBuilder buf = new StringBuilder(present * 2048).append(NEWLINE);
             buf.append("Recent access records: ").append(NEWLINE);
 
             int i = 1;
             Set<String> seen = new HashSet<String>(present);
             for (; oldHead != TraceRecord.BOTTOM; oldHead = oldHead.next) {
+                // 获取调用栈信息
                 String s = oldHead.toString();
                 if (seen.add(s)) {
+                    /**
+                     * 遍历到最初的记录与其他节点的输出有所不同
+                     */
                     if (oldHead.next == TraceRecord.BOTTOM) {
                         buf.append("Created at:").append(NEWLINE).append(s);
                     } else {
                         buf.append('#').append(i++).append(':').append(NEWLINE).append(s);
                     }
                 } else {
+                    // 出现重复的记录
                     duped++;
                 }
             }
 
+            /**
+             * 当出现重复记录时，加上特殊日志
+             */
             if (duped > 0) {
                 buf.append(": ")
                         .append(duped)
@@ -544,6 +627,11 @@ public class ResourceLeakDetector<T> {
                         .append(NEWLINE);
             }
 
+            /**
+             * 若出现重复记录超过TARGET_RECORDS(默认为4）
+             * 则输出丢弃了多少记录等额外信息
+             * 可通过设置io.netty.leakDetection.targetRecords来修改记录长度
+             */
             if (dropped > 0) {
                 buf.append(": ")
                    .append(dropped)
@@ -626,19 +714,29 @@ public class ResourceLeakDetector<T> {
             pos = -1;
         }
 
+        /**
+         * 创建Record的toStirng（）方法
+         * 获取Record创建时的调用栈信息
+         * @return
+         */
         @Override
         public String toString() {
             StringBuilder buf = new StringBuilder(2048);
+            // 先添加提示信息
             if (hintString != null) {
                 buf.append("\tHint: ").append(hintString).append(NEWLINE);
             }
 
+            // 再添加栈信息
             // Append the stack trace.
             StackTraceElement[] array = getStackTrace();
+            // 跳过前面三个栈元素
+            // 因为他们是record（）方法的栈信息，显示没有意义
             // Skip the first three elements.
             out: for (int i = 3; i < array.length; i++) {
                 StackTraceElement element = array[i];
                 // Strip the noisy stack trace elements.
+                // 跳过一些不必要的方法信息
                 String[] exclusions = excludedMethods.get();
                 for (int k = 0; k < exclusions.length; k += 2) {
                     // Suppress a warning about out of bounds access
@@ -649,8 +747,10 @@ public class ResourceLeakDetector<T> {
                     }
                 }
 
+                // 格式化
                 buf.append('\t');
                 buf.append(element.toString());
+                // 加上换行
                 buf.append(NEWLINE);
             }
             return buf.toString();

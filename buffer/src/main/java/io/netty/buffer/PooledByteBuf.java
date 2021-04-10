@@ -60,14 +60,23 @@ abstract class PooledByteBuf<T> extends AbstractReferenceCountedByteBuf {
         assert handle >= 0;
         assert chunk != null;
 
+        // 大内存默认为16MB。被分配给多个PooledByteBuf
         this.chunk = chunk;
+        // chunk中具体的缓存空间
         memory = chunk.memory;
+        // 将PooledByteBuf转换成ByteBuffer
         tmpNioBuf = nioBuffer;
+        // 内存分配器，PooledByteBuf是由Arena分配器构建的
         allocator = chunk.arena.parent;
+        // 线程缓存
         this.cache = cache;
+        // 通过这个指针可以得到PooledByteBuf在chunk这可二叉树中的具体位置
         this.handle = handle;
+        // 偏移量
         this.offset = offset;
+        // 长度：实际数据长度
         this.length = length;
+        // 写指针不能超过PooledByteBuf数据最大可用长度
         this.maxLength = maxLength;
     }
 
@@ -91,14 +100,26 @@ abstract class PooledByteBuf<T> extends AbstractReferenceCountedByteBuf {
         return Math.min(maxLength, maxCapacity()) - writerIndex;
     }
 
+    // 自动扩容
     @Override
     public final ByteBuf capacity(int newCapacity) {
+        // 若新的容量值与长度相等，则无需扩容，直接返回即可
         if (newCapacity == length) {
             ensureAccessible();
             return this;
         }
+        // 检查新的容量值是否大于最大允许容量值
         checkNewCapacity(newCapacity);
+        /**
+         * 非内存池，在新容量值小于最大长度值的情况下，无需重新分配
+         * 只需修改索引和数据长度即可
+         */
         if (!chunk.unpooled) {
+            /**
+             * 新的容量值大于长度值
+             * 在没有超过Buffer的最大可用的长度值时，只需把长度设为新的容量值即可
+             * 若超过了最大可用长度值，则只能重新分配
+             */
             // If the request capacity does not require reallocation, just update the length of the memory.
             if (newCapacity > length) {
                 if (newCapacity <= maxLength) {
@@ -107,6 +128,7 @@ abstract class PooledByteBuf<T> extends AbstractReferenceCountedByteBuf {
                 }
             } else if (newCapacity > maxLength >>> 1 &&
                     (maxLength > 512 || newCapacity > maxLength - 16)) {
+                // 当新容量值小于最大可用长度值时，其读/写索引不能超过新容量值
                 // here newCapacity < length
                 length = newCapacity;
                 trimIndicesToCapacity(newCapacity);
@@ -162,12 +184,16 @@ abstract class PooledByteBuf<T> extends AbstractReferenceCountedByteBuf {
 
     protected abstract ByteBuffer newInternalNioBuffer(T memory);
 
+    /**
+     * 对象回收，把对象属性情况
+     */
     @Override
     protected final void deallocate() {
         if (handle >= 0) {
             final long handle = this.handle;
             this.handle = -1;
             memory = null;
+            // 释放内存
             chunk.arena.free(chunk, tmpNioBuf, handle, maxLength, cache);
             tmpNioBuf = null;
             chunk = null;
@@ -175,7 +201,8 @@ abstract class PooledByteBuf<T> extends AbstractReferenceCountedByteBuf {
         }
     }
 
-    private void recycle() {
+    /**
+     * 把PooledByteBuf放回对象池Stack中，以便下次使用ate void recycle() {
         recyclerHandle.recycle(this);
     }
 
@@ -184,17 +211,29 @@ abstract class PooledByteBuf<T> extends AbstractReferenceCountedByteBuf {
     }
 
     final ByteBuffer _internalNioBuffer(int index, int length, boolean duplicate) {
+        // 根据readIndex获取偏移量offset
         index = idx(index);
+        // 从memory中复制一份内存对象，两者共享缓存区，但其位置指针独立维护
         ByteBuffer buffer = duplicate ? newInternalNioBuffer(memory) : internalNioBuffer();
+        // 设置新的byteBuffer位置及其最大长度
         buffer.limit(index + length).position(index);
         return buffer;
     }
 
+    /**
+     * 从memory中创建一份缓存ByteBuffer
+     * 与memory共享底层数据，但读/写索引独立维护
+     * @param index
+     * @param length
+     * @return
+     */
     ByteBuffer duplicateInternalNioBuffer(int index, int length) {
+        // 检查
         checkIndex(index, length);
         return _internalNioBuffer(index, length, true);
     }
 
+    // 只有当tmpNioBuf为空时才创建新的共享缓冲区
     @Override
     public final ByteBuffer internalNioBuffer(int index, int length) {
         checkIndex(index, length);
@@ -221,6 +260,17 @@ abstract class PooledByteBuf<T> extends AbstractReferenceCountedByteBuf {
         return true;
     }
 
+    /**
+     * channel从PooledByteBuf中获取数据
+     * PooledByteBuf读索引的变化
+     * 由父类AbstractByteBuf的readByes（）方法维护
+     * @param index
+     * @param out
+     * @param length the maximum number of bytes to transfer
+     *
+     * @return
+     * @throws IOException
+     */
     @Override
     public final int getBytes(int index, GatheringByteChannel out, int length) throws IOException {
         return out.write(duplicateInternalNioBuffer(index, length));
@@ -256,11 +306,23 @@ abstract class PooledByteBuf<T> extends AbstractReferenceCountedByteBuf {
         }
     }
 
+    /**
+     * 从channel中读取数并写入PooledByteBuf中
+     * writerIndex 由父类AbstractByteBuf的writeBytes（）方法维护
+     * @param index
+     * @param in
+     * @param position the file position at which the transfer is to begin
+     * @param length the maximum number of bytes to transfer
+     *
+     * @return
+     * @throws IOException
+     */
     @Override
     public final int setBytes(int index, FileChannel in, long position, int length) throws IOException {
         try {
             return in.read(internalNioBuffer(index, length), position);
         } catch (ClosedChannelException ignored) {
+            // 客户端主动关闭连接，返回-1.触发对应的用户事件
             return -1;
         }
     }

@@ -2475,6 +2475,7 @@ public abstract class ByteBuf implements ReferenceCounted, Comparable<ByteBuf> {
      * against using the buffer after it was released (best-effort).
      */
     boolean isAccessible() {
+        // 引用计数是否大于0
         return refCnt() != 0;
     }
 }

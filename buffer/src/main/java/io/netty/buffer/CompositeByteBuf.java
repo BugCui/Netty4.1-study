@@ -44,7 +44,8 @@ import static io.netty.util.internal.ObjectUtil.checkNotNull;
 /**
  * A virtual buffer which shows multiple buffers as a single merged buffer.  It is recommended to use
  * {@link ByteBufAllocator#compositeBuffer()} or {@link Unpooled#wrappedBuffer(ByteBuf...)} instead of calling the
- * constructor explicitly.
+ * constructor explicitly.\
+ * 组合多个ByteBuf，对外提供统一的readerIndex和writerIndex
  */
 public class CompositeByteBuf extends AbstractReferenceCountedByteBuf implements Iterable<ByteBuf> {
 
@@ -259,10 +260,14 @@ public class CompositeByteBuf extends AbstractReferenceCountedByteBuf implements
      * @param cIndex the index on which the {@link ByteBuf} will be added.
      * @param buffer the {@link ByteBuf} to add. {@link ByteBuf#release()} ownership is transferred to this
      * {@link CompositeByteBuf}.
+     *               添加byteBuf
      */
     public CompositeByteBuf addComponent(boolean increaseWriterIndex, int cIndex, ByteBuf buffer) {
         checkNotNull(buffer, "buffer");
+        // 把buffer加入Component数组中
+        // 并对数组中的元素进行相应的挪动
         addComponent0(increaseWriterIndex, cIndex, buffer);
+        // 是否需要合并成一个ByteBuf
         consolidateIfNeeded();
         return this;
     }
@@ -281,9 +286,11 @@ public class CompositeByteBuf extends AbstractReferenceCountedByteBuf implements
         assert buffer != null;
         boolean wasAdded = false;
         try {
+            // 检查下标是否正常
             checkComponentIndex(cIndex);
 
             // No need to consolidate - just add a component to the list.
+            // 构建包装component
             Component c = newComponent(ensureAccessible(buffer), 0);
             int readableBytes = c.length();
 
@@ -291,18 +298,27 @@ public class CompositeByteBuf extends AbstractReferenceCountedByteBuf implements
             // See https://github.com/netty/netty/issues/10194
             checkForOverflow(capacity(), readableBytes);
 
+            // 把component追加到数组中，并移动其后面的元素
             addComp(cIndex, c);
             wasAdded = true;
             if (readableBytes > 0 && cIndex < componentCount - 1) {
+                /**
+                 * 当插入的位置不在数组末尾时
+                 * 不仅需要设置插入元素的位置信息
+                 * 还需要更新其后面的元素的位置信息
+                 */
                 updateComponentOffsets(cIndex);
             } else if (cIndex > 0) {
+                // 插入元素在数组末尾时，秩序设置插入元素的位置信息即可
                 c.reposition(components[cIndex - 1].endOffset);
             }
+            // 是否修改写索引
             if (increaseWriterIndex) {
                 writerIndex += readableBytes;
             }
             return cIndex;
         } finally {
+            // 当出现异常增加失败时，释放buffer
             if (!wasAdded) {
                 buffer.release();
             }
@@ -318,11 +334,15 @@ public class CompositeByteBuf extends AbstractReferenceCountedByteBuf implements
 
     @SuppressWarnings("deprecation")
     private Component newComponent(final ByteBuf buf, final int offset) {
+        // 获取buf读索引及buf的长度
         final int srcIndex = buf.readerIndex();
         final int len = buf.readableBytes();
 
         // unpeel any intermediate outer layers (UnreleasableByteBuf, LeakAwareByteBufs, SwappedByteBuf)
         ByteBuf unwrapped = buf;
+        // 若是派生ByteBuf，则需要通过unwrap得到原始ByteBuf
+        // 原始buf的读索引=派生buf读索引+偏移量adjustment
+        // 由于是非可重复利用内存，所以其读索引应为0
         int unwrappedIndex = srcIndex;
         while (unwrapped instanceof WrappedByteBuf || unwrapped instanceof SwappedByteBuf) {
             unwrapped = unwrapped.unwrap();
@@ -343,6 +363,7 @@ public class CompositeByteBuf extends AbstractReferenceCountedByteBuf implements
         // is already the entire buffer
         final ByteBuf slice = buf.capacity() == len ? buf : null;
 
+        // 包装成Component对象返回，并设置为大端模式，（与网络传输模式一致）
         return new Component(buf.order(ByteOrder.BIG_ENDIAN), srcIndex,
                 unwrapped.order(ByteOrder.BIG_ENDIAN), unwrappedIndex, offset, len, slice);
     }
@@ -562,6 +583,8 @@ public class CompositeByteBuf extends AbstractReferenceCountedByteBuf implements
     private void consolidateIfNeeded() {
         // Consolidate if the number of components will exceed the allowed maximum by the current
         // operation.
+        // 若components数组中的元素超过了其允许的最大容量
+        // 则需要把所有ByteBuf合并成一个
         int size = componentCount;
         if (size > maxNumComponents) {
             consolidate0(0, size);
@@ -908,6 +931,7 @@ public class CompositeByteBuf extends AbstractReferenceCountedByteBuf implements
 
     private int toComponentIndex0(int offset) {
         int size = componentCount;
+        // 偏移量为0，快速获取第一个元素
         if (offset == 0) { // fast-path zero offset
             for (int i = 0; i < size; i++) {
                 if (components[i].endOffset > 0) {
@@ -915,9 +939,17 @@ public class CompositeByteBuf extends AbstractReferenceCountedByteBuf implements
                 }
             }
         }
+        // 当少于或等于两个元素时，没必要使用二分查找算法，只需快速判断并获取即可
         if (size <= 2) { // fast-path for 1 and 2 component count
             return size == 1 || offset < components[0].endOffset ? 0 : 1;
         }
+        /**
+         * 当components数组中的元素个数多余两个时，使用二分查找算法
+         * 其分割规则主要根据偏移量来判断
+         * 当偏移量大于或等于元素的endOffset时，low=mid+1
+         * 当偏移量小于遍历元素的offset时，high=mid-1
+         * 当偏移量等于遍历元素的offset时，只需返回下标即可
+         */
         for (int low = 0, high = size; low <= high;) {
             int mid = low + high >>> 1;
             Component c = components[mid];
@@ -930,6 +962,7 @@ public class CompositeByteBuf extends AbstractReferenceCountedByteBuf implements
             }
         }
 
+        // 若没有找到，则跑出异常
         throw new Error("should not reach here");
     }
 
@@ -1046,21 +1079,43 @@ public class CompositeByteBuf extends AbstractReferenceCountedByteBuf implements
         }
     }
 
+    /**
+     *
+     * @param index 读索引
+     * @param dst   目标缓存
+     * @param dstIndex the first index of the destination 目标缓存写索引
+     * @param length   the number of bytes to transfer      读取长度
+     *
+     * @return
+     */
     @Override
     public CompositeByteBuf getBytes(int index, byte[] dst, int dstIndex, int length) {
+        // 检查index，length，dstIndex，dst.capacity（）是否合法
         checkDstIndex(index, length, dstIndex, dst.length);
         if (length == 0) {
             return this;
         }
 
+        // 根据rederIndex获取components数组的小标
         int i = toComponentIndex0(index);
+        /**
+         * 由于butebuf是逻辑组合
+         * 在读的过程中，一个buf可能不够
+         * 需要从多个buf中读取数据，因此需要while循环，直到写满
+         */
         while (length > 0) {
             Component c = components[i];
+            // 在每次读数据时，只能读取当前buf的可读字节与length两种中的最小值
             int localLength = Math.min(length, c.endOffset - index);
+            // 从buf中读取localLength字节到dst中
             c.buf.getBytes(c.idx(index), dst, dstIndex, localLength);
+            // 其读索引值需要增加localLength
             index += localLength;
+            // 目标buf的写索引需要进行相应的增加
             dstIndex += localLength;
+            // 对需要写的字节进行相应调整
             length -= localLength;
+            // components数组的下表也要向上移动一位
             i ++;
         }
         return this;
@@ -1366,14 +1421,21 @@ public class CompositeByteBuf extends AbstractReferenceCountedByteBuf implements
         return this;
     }
 
+    // 从src缓冲区读取数据并写入CompositeByteBuf中
     @Override
     public CompositeByteBuf setBytes(int index, ByteBuf src, int srcIndex, int length) {
+        // 检查
         checkSrcIndex(index, length, srcIndex, src.capacity());
         if (length == 0) {
             return this;
         }
 
+        // 根据writerIndex获取components数组的下标
         int i = toComponentIndex0(index);
+        /**
+         * 循环写入，逻辑与循环读数据逻辑类似
+         * 知识index从readerIndex换成了writeIndex
+         */
         while (length > 0) {
             Component c = components[i];
             int localLength = Math.min(length, c.endOffset - index);
@@ -1742,11 +1804,12 @@ public class CompositeByteBuf extends AbstractReferenceCountedByteBuf implements
         final int startOffset = cIndex != 0 ? components[cIndex].offset : 0;
         final int capacity = components[endCIndex - 1].endOffset - startOffset;
         final ByteBuf consolidated = allocBuffer(capacity);
-
+        // 循环遍历所有bytebuf，并把数据写入consolidated中
         for (int i = cIndex; i < endCIndex; i ++) {
             components[i].transferTo(consolidated);
         }
         lastAccessed = null;
+        // 移除components数组中下标为1~（size-1）的元素
         removeCompRange(cIndex + 1, endCIndex);
         components[cIndex] = newComponent(consolidated, 0);
         if (cIndex != 0 || numComponents != componentCount) {
@@ -1756,6 +1819,7 @@ public class CompositeByteBuf extends AbstractReferenceCountedByteBuf implements
 
     /**
      * Discard all {@link ByteBuf}s which are read.
+     * 移除缓冲器已读字节
      */
     public CompositeByteBuf discardReadComponents() {
         ensureAccessible();
@@ -1766,6 +1830,7 @@ public class CompositeByteBuf extends AbstractReferenceCountedByteBuf implements
 
         // Discard everything if (readerIndex = writerIndex = capacity).
         int writerIndex = writerIndex();
+        // 若读/写索引等于容量，则说明容量已使用完，全部释放即可
         if (readerIndex == writerIndex && writerIndex == capacity()) {
             for (int i = 0, size = componentCount; i < size; i++) {
                 components[i].free();
@@ -1780,27 +1845,39 @@ public class CompositeByteBuf extends AbstractReferenceCountedByteBuf implements
         // Remove read components.
         int firstComponentId = 0;
         Component c = null;
+        // 从数组第一个元素开始遍历
         for (int size = componentCount; firstComponentId < size; firstComponentId++) {
             c = components[firstComponentId];
+            /**
+             * 若结束为止大于读索引，则说明还有buf未读，无需再继续处理
+             * 否则需要释放
+             */
             if (c.endOffset > readerIndex) {
                 break;
             }
             c.free();
         }
+        // 一个都没释放
         if (firstComponentId == 0) {
             return this; // Nothing to discard
         }
+        // 最后一次访问时的子Buffer，则元素都释放了，置空la
         Component la = lastAccessed;
         if (la != null && la.endOffset <= readerIndex) {
             lastAccessed = null;
         }
+        // 从数组中移除已释放的元素
         removeCompRange(0, firstComponentId);
 
         // Update indexes and markers.
+        // 更新读/写索引
         int offset = c.offset;
+        // 从第一个元素开始更新元素的位置信息
         updateComponentOffsets(0);
         setIndex(readerIndex - offset, writerIndex - offset);
+        // 更新标记索引
         adjustMarkers(offset);
+        String s = "123";
         return this;
     }
 
@@ -2307,13 +2384,18 @@ public class CompositeByteBuf extends AbstractReferenceCountedByteBuf implements
         }
         final int size = componentCount;
         assert from >= 0 && to <= size;
+        // 若只移除中间元素
+        // 则需要把后面元素向前移动
         if (to < size) {
             System.arraycopy(components, to, components, from, size - to);
         }
+        // 处理后的元素个数
         int newSize = size - to + from;
+        // 把移除的元素置空
         for (int i = newSize; i < size; i++) {
             components[i] = null;
         }
+        // 更新元素个数
         componentCount = newSize;
     }
 

@@ -36,15 +36,38 @@ public abstract class AbstractByteBufAllocator implements ByteBufAllocator {
         ResourceLeakDetector.addExclusions(AbstractByteBufAllocator.class, "toLeakAwareBuffer");
     }
 
+    /**
+     * 内存泄漏检测入口
+     * ByteBuf在分配后需要交给内存泄漏检测器处理
+     * 处理完后对ByteBuf对象进行相应的包装并返回
+     * @param buf
+     * @return
+     */
     protected static ByteBuf toLeakAwareBuffer(ByteBuf buf) {
+        // 弱引用
         ResourceLeakTracker<ByteBuf> leak;
         switch (ResourceLeakDetector.getLevel()) {
+            // 默认级别
             case SIMPLE:
+                /**
+                 * 每种类型的资源都会创建一个内存泄漏检测器ResourceLeakDetector
+                 * 通过内存泄漏检测器获取弱引用
+                 */
                 leak = AbstractByteBuf.leakDetector.track(buf);
+                /**
+                 * 弱引用不为空，则说明此buf被采集器
+                 * buf一旦被采集
+                 * 就需要返回对应级别的包装对象，否则就会出现误报
+                 */
                 if (leak != null) {
                     buf = new SimpleLeakAwareByteBuf(buf, leak);
                 }
                 break;
+            /**
+             * 高级和偏执级别
+             * 由于他们都需要追踪buf的调用轨迹
+             * 因此返回的包装对象相同
+             */
             case ADVANCED:
             case PARANOID:
                 leak = AbstractByteBuf.leakDetector.track(buf);
@@ -247,23 +270,48 @@ public abstract class AbstractByteBufAllocator implements ByteBufAllocator {
         return StringUtil.simpleClassName(this) + "(directByDefault: " + directByDefault + ')';
     }
 
+    /**
+     * 当threshold小于阈值（4MB)时，新的容量（newCapacity）都是以64为计数向左移位计算出来的
+     * 通过循环，每次移动1位，直到newCapacity >= minNewCapacity
+     * 如果计算出来的newCapacity大于maxCapacity，则返回maxCapacity
+     * 否则返回newCapacity
+     * 当minNewCapacity > 阈值（4MB)时，
+     * 先计算minNewCapacity/threshold * threshold的大小
+     * 如果这个值加上一个threshold（4MB） 大于newCapacity
+     * 则newCapacity的值取maxCapacity
+     * 否则newCapacity=minNewCapacity/threshold*threshold + threshold
+     * @param minNewCapacity
+     * @param maxCapacity
+     * @return
+     */
     @Override
     public int calculateNewCapacity(int minNewCapacity, int maxCapacity) {
+        // 检查minNewCapacity是否大于0
         checkPositiveOrZero(minNewCapacity, "minNewCapacity");
         if (minNewCapacity > maxCapacity) {
             throw new IllegalArgumentException(String.format(
                     "minNewCapacity: %d (expected: not greater than maxCapacity(%d)",
                     minNewCapacity, maxCapacity));
         }
+        // 阈值4MB
         final int threshold = CALCULATE_THRESHOLD; // 4 MiB page
-
         if (minNewCapacity == threshold) {
             return threshold;
         }
-
+        // 当大于4MB时
         // If over threshold, do not double but just increase by threshold.
         if (minNewCapacity > threshold) {
+            // 先获取离minNewCapacity最近的4MB的整数倍数，且小于minNewCapacity
+            // 例如minNewCapacity=7
+            // newCapacity = (7 / 4) * 4 = 1,所以新的容量扩大1倍
             int newCapacity = minNewCapacity / threshold * threshold;
+            /**
+             * 此处新的容量值不会倍增，因为4MB以上内存比较大
+             * 如果继续倍增，则可能带来额外的内存浪费
+             * 只能在此基础上+4MB，并判断是否大于maxCapacity
+             * 若大于则返回maxCapacity
+             * 否则返回newCapacity+threshold
+             */
             if (newCapacity > maxCapacity - threshold) {
                 newCapacity = maxCapacity;
             } else {
@@ -274,10 +322,15 @@ public abstract class AbstractByteBufAllocator implements ByteBufAllocator {
 
         // Not over threshold. Double up to 4 MiB, starting from 64.
         int newCapacity = 64;
+        /**
+         * 当小于4MB时，以64为基础倍增
+         * 64 -》 128 -》256 -》。。。。直到满足最小容量要求，并以此容量值作为新的容量值
+         */
         while (newCapacity < minNewCapacity) {
             newCapacity <<= 1;
         }
 
+        // 这里保证  newCapacity<= maxCapacity
         return Math.min(newCapacity, maxCapacity);
     }
 }
